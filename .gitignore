@@ -222,3 +222,5 @@ __marimo__/
 data/
 .Trash-0/
 datamart/
+*.ppt
+*.pptx
