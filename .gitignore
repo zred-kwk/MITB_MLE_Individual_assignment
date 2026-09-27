@@ -221,3 +221,6 @@ __marimo__/
 *.csv
 data/
 .Trash-0/
+datamart/
+*.ppt
+*.pptx
