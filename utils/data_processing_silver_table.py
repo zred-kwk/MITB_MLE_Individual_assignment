@@ -164,6 +164,13 @@ def process_silver_financials_table(snapshot_date_str, bronze_financials_directo
         .otherwise(col("Num_Credit_Inquiries"))
     )
 
+    # Delay_from_due_date: null out impossible values
+    df = df.withColumn(
+    "Delay_from_due_date",
+    when((col("Delay_from_due_date") < 0), None)
+    .otherwise(col("Delay_from_due_date"))
+)
+
     # Credit_Mix: "_" placeholder -> null
     df = df.withColumn(
         "Credit_Mix",
