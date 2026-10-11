@@ -42,7 +42,7 @@ def main(snapshotdate):
         os.makedirs(bronze_lms_directory)
 
     # run data processing
-    utils.data_processing_bronze_table.process_bronze_table(date_str, bronze_lms_directory, spark)
+    utils.data_processing_bronze_table.process_bronze_lms_table(date_str, bronze_lms_directory, spark)
     
     # end spark session
     spark.stop()
