@@ -1,10 +1,10 @@
 import argparse
-import glob
 import os
 import pickle
 import pprint
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import pyspark
 import pyspark.sql.functions as F
@@ -12,7 +12,7 @@ import xgboost as xgb
 from dateutil.relativedelta import relativedelta
 from pyspark.sql.functions import col
 from sklearn.compose import ColumnTransformer
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import RandomizedSearchCV, StratifiedGroupKFold
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -31,7 +31,7 @@ MODEL_BANK_DIR = "model_bank/"
 # identifiers / label columns / raw free-text columns that are never model inputs
 EXCLUDE_COLS = [
     "loan_id", "snapshot_date", "label", "feature_snapshot_date", "Customer_ID",
-    "label_def", "loan_start_date", "Occupation", "Type_of_Loan",
+    "label_def", "loan_start_date", "Occupation", "Type_of_Loan","Clickstream_Months_Observed"
 ]
 
 PARAM_DIST = {
@@ -45,6 +45,13 @@ PARAM_DIST = {
     "reg_alpha": [0, 0.1, 1],
     "reg_lambda": [1, 1.5, 2],
 }
+
+
+# monitoring reference (read by model_monitor.py): bins per feature / score, and the
+# number of most frequent categories kept per categorical feature
+REFERENCE_BINS = 10
+REFERENCE_MAX_CATEGORIES = 20
+MOB_MONTHS = 6
 
 
 def build_config(snapshotdate, train_test_period_months=12, oot_period_months=2, train_test_ratio=0.8):
@@ -67,16 +74,29 @@ def build_config(snapshotdate, train_test_period_months=12, oot_period_months=2,
     return config
 
 
-def read_store(spark, folder_path):
-    files_list = [folder_path + os.path.basename(f) for f in glob.glob(os.path.join(folder_path, "*"))]
-    if not files_list:
-        raise FileNotFoundError("No partitions found under " + folder_path)
-    return spark.read.option("header", "true").parquet(*files_list)
+def read_store(spark, folder, prefix, first_month, last_month):
+    """
+    Read only the monthly partitions in [first_month, last_month] (first-of-month dates).
+    Globbing the whole folder could pick up a partition that gold_feature is still
+    writing for the same run, or stale partitions from old runs.
+    """
+    paths, missing, d = [], [], first_month
+    while d <= last_month:
+        p = f"{folder}{prefix}_{d:%Y_%m_%d}.parquet"
+        (paths if os.path.exists(p) else missing).append(p)
+        d += relativedelta(months=1)
+    if missing:
+        raise FileNotFoundError(f"Missing partitions: {missing}")
+    return spark.read.option("header", "true").parquet(*paths)
 
 
 def load_data(spark, config):
+    # Labels needed: label dates from the start of the train/test window up to T - 1 month.
+    label_first = config["train_test_start_date"]
+    label_last = config["model_train_date"] - relativedelta(months=1)
+
     # --- label store: filtered to the train/test + OOT window on the label date ---
-    label_store_sdf = read_store(spark, LABEL_STORE_DIR)
+    label_store_sdf = read_store(spark, LABEL_STORE_DIR, "gold_label_store", label_first, label_last)
     labels_sdf = label_store_sdf.filter(
         (col("snapshot_date") >= config["train_test_start_date"]) & (col("snapshot_date") <= config["oot_end_date"])
     )
@@ -85,9 +105,14 @@ def load_data(spark, config):
     if n_labels == 0:
         raise ValueError("No labels in the window for snapshot " + config["model_train_date_str"])
 
-    # --- feature store: NOT date-filtered. A label dated s needs the features dated at its origination
-    #     (s - mob months), so the labels define the window and loan_id does the matching. ---
-    features_store_sdf = read_store(spark, FEATURE_STORE_DIR)
+    # --- feature store: only the partitions the label window requires. A label dated s needs
+    #     the features dated at its origination (s - mob months), so the labels define the
+    #     window and loan_id does the matching. Never reads features from T itself. ---
+    features_store_sdf = read_store(
+        spark, FEATURE_STORE_DIR, "gold_feature_store",
+        label_first - relativedelta(months=MOB_MONTHS),
+        label_last - relativedelta(months=MOB_MONTHS),
+    )
     feat_sdf = (
         features_store_sdf
         .withColumnRenamed("snapshot_date", "feature_snapshot_date")
@@ -101,7 +126,15 @@ def load_data(spark, config):
         raise ValueError(f"Join changed the row count ({n_labels} labels -> {len(data_pdf)}): duplicate loan_id in the feature store")
     n_unmatched = int(data_pdf["feature_snapshot_date"].isna().sum())
     if n_unmatched > 0:
-        raise ValueError(f"{n_unmatched} of {n_labels} labels have no feature row (join on loan_id)")
+        unmatched = data_pdf[data_pdf["feature_snapshot_date"].isna()]
+        last_feat = features_store_sdf.agg(F.max("snapshot_date")).first()[0]
+        raise ValueError(
+            f"{n_unmatched} of {n_labels} labels have no feature row. "
+            f"Unmatched label dates: {unmatched['snapshot_date'].min()} to {unmatched['snapshot_date'].max()}. "
+            f"Last feature partition: {last_feat}. "
+            f"Labels need features dated label_date - {MOB_MONTHS} months."
+        )
+
     return data_pdf
 
 
@@ -187,8 +220,73 @@ def train_model(X_train, X_test, X_oot, y_train, y_test, y_oot, groups_train, nu
     return best_model, preprocessor, random_search.best_params_, auc
 
 
+def quantile_bins(values, n_bins=REFERENCE_BINS):
+    """Quantile bin edges (min..max, duplicates removed) and the share of values in each bin."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return [], []
+    edges = np.unique(np.quantile(values, np.linspace(0, 1, n_bins + 1)))
+    if len(edges) < 2:  # constant column: a single bin
+        edges = np.array([edges[0], edges[0]])
+    counts = np.histogram(values, bins=edges)[0]
+    return edges.tolist(), (counts / counts.sum()).tolist()
+
+
+def numeric_reference(series):
+    values = pd.to_numeric(series, errors="coerce")
+    x = values.dropna().astype(float)
+    ref = {"kind": "numeric", "missing_rate": float(values.isna().mean())}
+    if x.empty:
+        return ref
+    edges, pct = quantile_bins(x.to_numpy())
+    ref.update({
+        "mean": float(x.mean()),
+        "median": float(x.median()),
+        "var": float(x.var(ddof=1)) if len(x) > 1 else np.nan,
+        "std": float(x.std(ddof=1)) if len(x) > 1 else np.nan,
+        "edges": edges,
+        "pct": pct,
+    })
+    return ref
+
+
+def categorical_reference(series):
+    # missing values are their own category, the same way model_monitor.py maps them
+    shares = series.astype("string").fillna("__MISSING__").value_counts(normalize=True)
+    top = shares.iloc[:REFERENCE_MAX_CATEGORIES]
+    return {
+        "kind": "categorical",
+        "missing_rate": float(series.isna().mean()),
+        "categories": [str(c) for c in top.index],
+        "pct": top.to_numpy(dtype=float).tolist(),
+        "other_pct": float(max(0.0, 1.0 - top.sum())),
+    }
+
+
+def build_reference(X_train, y_oot, oot_scores, num_cols, cat_cols):
+    """
+    Distributions model_monitor.py compares live data against.
+      features : raw feature distributions of the training split
+      score_*  : model score distribution on the OOT window
+      roc_oot  : ROC curve on the OOT window, on a fixed 101-point FPR grid
+    """
+    score_edges, score_pct = quantile_bins(oot_scores)
+    features = {c: numeric_reference(X_train[c]) for c in num_cols}
+    features.update({c: categorical_reference(X_train[c]) for c in cat_cols})
+
+    fpr, tpr, _ = roc_curve(y_oot, oot_scores)
+    grid = np.linspace(0, 1, 101)
+    return {
+        "score_edges": score_edges,
+        "score_pct": score_pct,
+        "features": features,
+        "roc_oot": {"fpr": grid.tolist(), "tpr": np.interp(grid, fpr, tpr).tolist()},
+    }
+
+
 def build_artefact(config, model, preprocessor, best_params, auc, feature_cols, num_cols, cat_cols,
-                   X_train, X_test, X_oot, y_train, y_test, y_oot):
+                   X_train, X_test, X_oot, y_train, y_test, y_oot, reference):
     results = {}
     for split_name, auc_score in auc.items():
         results["auc_" + split_name] = auc_score
@@ -209,6 +307,8 @@ def build_artefact(config, model, preprocessor, best_params, auc, feature_cols, 
         },
         "results": results,
         "hp_params": best_params,
+        # distributions captured at training time; model_monitor.py compares live data to these
+        "reference": reference,
     }
 
 
@@ -252,10 +352,14 @@ def main(snapshotdate):
         X_train, X_test, X_oot, y_train, y_test, y_oot, groups_train, num_cols, cat_cols
     )
 
+    # --- monitoring reference: features from the training split, score and ROC from OOT ---
+    oot_scores = model.predict_proba(preprocessor.transform(X_oot))[:, 1]
+    reference = build_reference(X_train, y_oot, oot_scores, num_cols, cat_cols)
+
     # --- build + save model artefact ---
     model_artefact = build_artefact(
         config, model, preprocessor, best_params, auc, feature_cols, num_cols, cat_cols,
-        X_train, X_test, X_oot, y_train, y_test, y_oot,
+        X_train, X_test, X_oot, y_train, y_test, y_oot, reference,
     )
     pprint.pprint(model_artefact["results"])
 

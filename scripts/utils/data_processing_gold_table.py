@@ -29,6 +29,11 @@ def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, go
     # get customer at mob
     df = df.filter(col("mob") == mob)
 
+    n = df.count()
+    if n == 0:
+        print(f"WARNING: no loans at mob={mob} on {snapshot_date_str} "
+              f"(expected only in the first {mob} months of loan data)")
+
     # get label
     df = df.withColumn("label", F.when(col("dpd") >= dpd, 1).otherwise(0).cast(IntegerType()))
     df = df.withColumn("label_def", F.lit(str(dpd)+'dpd_'+str(mob)+'mob').cast(StringType()))
@@ -58,36 +63,57 @@ from pyspark.sql.types import IntegerType
 
 
 
-def _load_clickstream_preapplication(directory, prefix, cutoff_date, spark):
-    """
-    Aggregate every clickstream partition dated ON OR BEFORE cutoff_date
-    (the loan's origination date) into one row per Customer_ID: mean of
-    each fe_ column, plus how many months of history were available.
+from dateutil.relativedelta import relativedelta
 
-    Anchoring to <= origination date (rather than <= the mob==6 monitoring
-    date) keeps this a clean
-    "pre-application engagement" feature set, and avoids any leakage from the outcome window.
+def _load_clickstream_preapplication(directory, prefix, cutoff_date, spark, window_months=6):
     """
-    pattern = os.path.join(directory, f"{prefix}_*.parquet")
-    files = glob.glob(pattern)
+    Aggregate clickstream partitions in the trailing window
+    (cutoff_date - window_months, cutoff_date] into one row per Customer_ID:
+    mean of each fe_ column, plus how many months of history were available.
 
-    valid_files = []
-    for f in files:
+    The cutoff month's own partition MUST exist and be non-empty; otherwise
+    this raises rather than silently reusing older data.
+    """
+    window_start = cutoff_date - relativedelta(months=window_months)
+
+    parsed = []
+    for f in glob.glob(os.path.join(directory, f"{prefix}_*.parquet")):
         date_part = os.path.basename(f).replace(prefix + "_", "").replace(".parquet", "")
         try:
             file_date = datetime.strptime(date_part, "%Y_%m_%d")
         except ValueError:
             continue
         if file_date <= cutoff_date:
-            valid_files.append(f)
+            parsed.append((file_date, f))
 
-    if not valid_files:
-        return None
+    if not parsed:
+        raise ValueError(f"No clickstream partitions on or before {cutoff_date:%Y-%m-%d}")
+
+    latest_date, latest_file = max(parsed)
+    if latest_date < cutoff_date:
+        raise ValueError(
+            f"Clickstream stale for {cutoff_date:%Y-%m-%d}: latest partition is {latest_date:%Y-%m-%d}"
+        )
+    if spark.read.parquet(latest_file).limit(1).count() == 0:
+        raise ValueError(f"Clickstream partition for {cutoff_date:%Y-%m-%d} is empty")
+
+    valid_files = [f for d, f in parsed if d > window_start]
+
+    # The window must be complete: a missing middle month would otherwise be averaged over silently.
+    first_date = min(d for d, _ in parsed)
+    delta = relativedelta(cutoff_date, first_date)
+    months_since_first = delta.years * 12 + delta.months
+    expected = min(window_months, months_since_first + 1)
+    if len(valid_files) != expected:
+        raise ValueError(
+            f"Clickstream window incomplete for {cutoff_date:%Y-%m-%d}: "
+            f"{len(valid_files)}/{expected} partitions"
+        )
 
     df = spark.read.parquet(*valid_files)
     fe_cols = [c for c in df.columns if c.startswith("fe_")]
     if not fe_cols:
-        return None
+        raise ValueError(f"No fe_ columns in clickstream partitions for {cutoff_date:%Y-%m-%d}")
 
     agg_exprs = [F.round(F.avg(c), 2).alias(c) for c in fe_cols]
     agg_exprs.append(F.count(F.lit(1)).alias("Clickstream_Months_Observed"))
@@ -134,11 +160,15 @@ def process_gold_feature_table(
     # -----------------------------------------------------------------
     fin_partition = "silver_financials_" + origination_snapshot_date_str.replace('-', '_') + '.parquet'
     fin_filepath = silver_financials_directory + fin_partition
-    fin_df = spark.read.parquet(fin_filepath).drop("snapshot_date") if os.path.exists(fin_filepath) else None
+    if not os.path.exists(fin_filepath):
+        raise FileNotFoundError(f"Missing financials partition: {fin_filepath}")
+    fin_df = spark.read.parquet(fin_filepath).drop("snapshot_date")
 
     attr_partition = "silver_attributes_" + origination_snapshot_date_str.replace('-', '_') + '.parquet'
     attr_filepath = silver_attributes_directory + attr_partition
-    attr_df = spark.read.parquet(attr_filepath).drop("snapshot_date") if os.path.exists(attr_filepath) else None
+    if not os.path.exists(attr_filepath):
+        raise FileNotFoundError(f"Missing attributes partition: {attr_filepath}")
+    attr_df = spark.read.parquet(attr_filepath).drop("snapshot_date")
 
     # -----------------------------------------------------------------
     # 3. Clickstream: pre-application engagement only (<= origination date)
@@ -148,18 +178,10 @@ def process_gold_feature_table(
     )
 
     df = base
-    if fin_df is not None:
+    for name, right in [("financials", fin_df), ("attributes", attr_df), ("clickstream", click_df)]:
         pre_count = df.count()
-        df = df.join(fin_df, on="Customer_ID", how="left")
-        assert df.count() == pre_count, "fan-out detected in financials join (Customer_ID not unique in fin_df)"
-    if attr_df is not None:
-        pre_count = df.count()
-        df = df.join(attr_df, on="Customer_ID", how="left")
-        assert df.count() == pre_count, "fan-out detected in attributes join (Customer_ID not unique in attr_df)"
-    if click_df is not None:
-        pre_count = df.count()
-        df = df.join(click_df, on="Customer_ID", how="left")
-        assert df.count() == pre_count, "fan-out detected in clickstream join (Customer_ID not unique in click_df)"
+        df = df.join(right, on="Customer_ID", how="left")
+        assert df.count() == pre_count, f"fan-out detected in {name} join (Customer_ID not unique)"
 
     # -----------------------------------------------------------------
     # 4. Derived features -- all sourced from origination-time financials/
@@ -246,7 +268,7 @@ def process_gold_feature_table(
             F.round(F.sqrt(sum(col(c) * col(c) for c in fe_cols)), 2)
         ) # Euclidean norm of the clickstream feature vector
 
-    df = df.drop("Credit_History_Age", "Credit_History_Years", "Credit_History_Months_part","Name","SSN")
+    df = df.drop("Credit_History_Age", "Credit_History_Years", "Credit_History_Months_part","Name","SSN", "Post_EMI_Slack", "Monthly_Inhand_Salary","Loan_Type_Diversity")
 
     # -----------------------------------------------------------------
     # 5. Save gold table

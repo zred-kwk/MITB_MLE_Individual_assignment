@@ -8,3 +8,4 @@ scikit-learn==1.6.1
 pyspark==3.5.5
 xgboost==3.0.0
 apache-airflow==2.10.5
+shap==0.54.1

@@ -14,6 +14,14 @@ import argparse
 from pyspark.sql.functions import col, when, regexp_replace, regexp_extract, trim, round as spark_round
 from pyspark.sql.types import StringType, IntegerType, FloatType, DoubleType, DateType
 
+def _read_bronze_csv(filepath, spark):
+    df = spark.read.csv(filepath, header=True, inferSchema=True)
+    n = df.count()
+    print('loaded from:', filepath, 'row count:', n)
+    if n == 0:
+        raise ValueError(f"Empty bronze partition: {filepath}")
+    return df
+
 
 def process_silver_loan_table(snapshot_date_str, bronze_lms_directory, silver_loan_daily_directory, spark):
     # prepare arguments
@@ -22,8 +30,7 @@ def process_silver_loan_table(snapshot_date_str, bronze_lms_directory, silver_lo
     # connect to bronze table
     partition_name = "bronze_loan_daily_" + snapshot_date_str.replace('-','_') + '.csv'
     filepath = bronze_lms_directory + partition_name
-    df = spark.read.csv(filepath, header=True, inferSchema=True)
-    print('loaded from:', filepath, 'row count:', df.count())
+    df = _read_bronze_csv(filepath, spark)
 
     # clean data: enforce schema / data type
     # Dictionary specifying columns and their desired datatypes
@@ -70,8 +77,7 @@ def process_silver_financials_table(snapshot_date_str, bronze_financials_directo
     # connect to bronze table
     partition_name = "bronze_financials_" + snapshot_date_str.replace('-','_') + '.csv'
     filepath = bronze_financials_directory + partition_name
-    df = spark.read.csv(filepath, header=True, inferSchema=True)
-    print('loaded from:', filepath, 'row count:', df.count())
+    df = _read_bronze_csv(filepath, spark)
 
     # clean data: enforce schema / data type on columns that don't need special handling
     column_type_map = {
@@ -247,8 +253,7 @@ def process_silver_attributes_table(snapshot_date_str, bronze_attributes_directo
     # connect to bronze table
     partition_name = "bronze_attributes_" + snapshot_date_str.replace('-','_') + '.csv'
     filepath = bronze_attributes_directory + partition_name
-    df = spark.read.csv(filepath, header=True, inferSchema=True)
-    print('loaded from:', filepath, 'row count:', df.count())
+    df = _read_bronze_csv(filepath, spark)
 
     # clean data: enforce schema / data type
     column_type_map = {
