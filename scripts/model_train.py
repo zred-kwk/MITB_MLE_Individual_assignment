@@ -12,7 +12,7 @@ import xgboost as xgb
 from dateutil.relativedelta import relativedelta
 from pyspark.sql.functions import col
 from sklearn.compose import ColumnTransformer
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import make_scorer, roc_auc_score, roc_curve
 from sklearn.model_selection import RandomizedSearchCV, StratifiedGroupKFold
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -31,7 +31,7 @@ MODEL_BANK_DIR = "model_bank/"
 # identifiers / label columns / raw free-text columns that are never model inputs
 EXCLUDE_COLS = [
     "loan_id", "snapshot_date", "label", "feature_snapshot_date", "Customer_ID",
-    "label_def", "loan_start_date", "Occupation", "Type_of_Loan","Clickstream_Months_Observed"
+    "label_def", "loan_start_date", "Occupation", "Type_of_Loan"
 ]
 
 PARAM_DIST = {

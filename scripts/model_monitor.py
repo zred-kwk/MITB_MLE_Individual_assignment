@@ -21,7 +21,7 @@ MISSING_RATE_ALERT = 0.5
 
 # PSI / CSI conventional cut-offs (moderate / significant shift).
 PSI_WARN, PSI_ALERT = 0.10, 0.25
-
+MISSING_FEATURE_PSI = 10.0
 
 # ---------------------------------------------------------------------
 # PSI and data-loading helpers
@@ -250,7 +250,7 @@ def compute_feature_drift(ref_features, drift_features, snapshotdate):
 
         if feature not in drift_features.columns:
             covariate_rows.append({
-                **common, "n": 0, "psi": np.nan,
+                **common, "n": 0, "psi": MISSING_FEATURE_PSI,
                 "status": "feature_not_in_feature_store",
             })
             continue
@@ -293,7 +293,7 @@ def compute_feature_drift(ref_features, drift_features, snapshotdate):
 
         if x.empty:
             covariate_rows.append({
-                **common, "n": 0, "psi": np.nan,
+                **common, "n": 0, "psi": MISSING_FEATURE_PSI,
                 "status": "all_values_missing",
             })
             continue
