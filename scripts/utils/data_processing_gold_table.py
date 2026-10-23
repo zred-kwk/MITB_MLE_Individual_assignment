@@ -116,7 +116,6 @@ def _load_clickstream_preapplication(directory, prefix, cutoff_date, spark, wind
         raise ValueError(f"No fe_ columns in clickstream partitions for {cutoff_date:%Y-%m-%d}")
 
     agg_exprs = [F.round(F.avg(c), 2).alias(c) for c in fe_cols]
-    agg_exprs.append(F.count(F.lit(1)).alias("Clickstream_Months_Observed"))
 
     return df.groupBy("Customer_ID").agg(*agg_exprs)
 
